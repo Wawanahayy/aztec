@@ -1,13 +1,11 @@
-// run.mjs - Aztec Flush Bot (Genesis-Based Epoch, English Logs)
+// run.mjs - Aztec Flush Bot (Simple & Accurate)
 import { ethers } from 'ethers';
 import 'dotenv/config';
 
-const GENESIS_TIMESTAMP = 1733356800; 
-const EPOCH_DURATION_SEC = 2304;       
-const EPOCH_WINDOW_SEC = 15;           
-const CHECK_INTERVAL_MS = 10_000;      
-const SPAM_INTERVAL_MS = 500;          
-const SPAM_DURATION_SEC = 10;          
+const GENESIS_TIMESTAMP = 1733356800; // Dec 5, 2024 @ 00:00 UTC
+const EPOCH_DURATION_SEC = 2304;       // ~38.4 minutes
+const EPOCH_WINDOW_SEC = 15;           // Only first 15 seconds are valid
+const CHECK_INTERVAL_MS = 10_000;      // Normal check every 10s
 const MAX_REWARD_TO_CLAIM = ethers.parseEther("1000");
 
 if (!process.env.RPC_URL) throw new Error("❌ Missing RPC_URL in .env");
@@ -80,10 +78,10 @@ async function getGasConfig(provider, strategy, addGwei = 2, percent = 20) {
   };
 }
 
-// --- Accurate Epoch Info (Uses BLOCK TIMESTAMP, not local time) ---
+// --- Epoch Info (Uses BLOCK TIMESTAMP) ---
 async function getEpochInfo() {
   const block = await provider.getBlock('latest');
-  const currentTimestamp = block.timestamp; // ⬅️ On-chain time!
+  const currentTimestamp = block.timestamp;
 
   if (currentTimestamp < GENESIS_TIMESTAMP) {
     throw new Error("Aztec epoch has not started yet (before genesis).");
@@ -101,25 +99,8 @@ async function getEpochInfo() {
     epochEnd: new Date(epochEndSec * 1000),
     nextEpochStart: new Date(epochEndSec * 1000),
     isEarly: secondsIntoEpoch < EPOCH_WINDOW_SEC,
-    secondsIntoEpoch,
-    blockTimestamp: currentTimestamp
+    secondsIntoEpoch
   };
-}
-
-// --- Countdown Formatter (English) ---
-function formatCountdown(nextEpochStart) {
-  const now = Date.now();
-  const diffMs = nextEpochStart.getTime() - now;
-  if (diffMs <= 0) return "Now!";
-  const totalSeconds = Math.floor(diffMs / 1000);
-  if (totalSeconds < 60) return `${totalSeconds} seconds`;
-  if (totalSeconds < 3600) {
-    const mins = Math.floor(totalSeconds / 60);
-    const secs = totalSeconds % 60;
-    return `${mins} minutes ${secs} seconds`;
-  }
-  const hours = Math.floor(totalSeconds / 3600);
-  return `${hours} hours`;
 }
 
 // --- Flush Function ---
@@ -167,6 +148,7 @@ async function tryFlush(currentEpoch) {
   }
 }
 
+// --- Auto Claim ---
 async function autoClaim() {
   try {
     const rewards = await flushRewarder.rewardsOf(wallet.address);
@@ -184,6 +166,7 @@ async function autoClaim() {
   }
 }
 
+// --- Main Loop ---
 async function runForever() {
   const GAS_STRATEGY = (process.env.GAS_STRATEGY || 'auto').toLowerCase();
   if (!['auto', 'aggressive', 'percent'].includes(GAS_STRATEGY)) {
@@ -197,13 +180,14 @@ async function runForever() {
   console.log(`🛡️  Max Claim: ${ethers.formatEther(MAX_REWARD_TO_CLAIM)} $AZTEC`);
   console.log(`⏱️  Flush window: first ${EPOCH_WINDOW_SEC} seconds of each epoch\n`);
 
-  let inSpamMode = false;
+  let lastFlushedEpoch = -1n;
 
   while (true) {
     try {
-      const info = await getEpochInfo();
       const nowLocal = new Date();
+      const info = await getEpochInfo();
 
+      // Read rewards & pool
       let rewardsAZTEC = "0.0";
       let poolAZTEC = "0.0";
       try {
@@ -215,7 +199,10 @@ async function runForever() {
         console.error('Failed to read reward/pool status:', e.message);
       }
 
-      const countdown = formatCountdown(info.nextEpochStart);
+      // Simple countdown for display only
+      const diffMs = info.nextEpochStart.getTime() - Date.now();
+      const countdown = diffMs <= 0 ? "Now!" : `${Math.ceil(diffMs / 1000)}s`;
+
       console.log(
         `[${nowLocal.toLocaleTimeString()}] 📊 Epoch ${info.currentEpoch}\n` +
         `   💰 Your rewards : ${rewardsAZTEC} $AZTEC\n` +
@@ -225,43 +212,25 @@ async function runForever() {
         `   ⏳ Next flush in: ${countdown}\n`
       );
 
+      // Always claim if there's unclaimed reward
       if (rewardsAZTEC !== "0.0") {
         await autoClaim();
       }
 
-      const msUntilNextEpoch = info.nextEpochStart.getTime() - Date.now();
-      const shouldSpam = msUntilNextEpoch > 0 && msUntilNextEpoch < 5000; 
-
-      if (shouldSpam && !inSpamMode) {
-        console.log(`🎯 Entering SPAM MODE for next epoch ${info.currentEpoch + 1n}!`);
-        inSpamMode = true;
-      }
-
-      if (inSpamMode) {
-
-        for (let i = 0; i < SPAM_DURATION_SEC * (1000 / SPAM_INTERVAL_MS); i++) {
-          const freshInfo = await getEpochInfo(); // selalu pakai timestamp blok!
-          if (freshInfo.isEarly) {
-            console.log(`🔥 Flush window OPEN (second ${freshInfo.secondsIntoEpoch})!`);
-            await tryFlush(freshInfo.currentEpoch);
-            await autoClaim();
-            break; 
-          }
-          await new Promise(r => setTimeout(r, SPAM_INTERVAL_MS));
-        }
-        inSpamMode = false;
-        continue; 
-      }
-
-      if (info.isEarly) {
+      // Flush ONLY if:
+      // 1. We're in the first 15s of the epoch (on-chain time)
+      // 2. We haven't flushed this epoch yet
+      if (info.isEarly && info.currentEpoch !== lastFlushedEpoch) {
         await tryFlush(info.currentEpoch);
-        await autoClaim();
+        await autoClaim(); // claim immediately after flush if any
+        lastFlushedEpoch = info.currentEpoch;
       }
 
     } catch (e) {
       console.error('❌ Main loop error:', e.message);
     }
 
+    // Wait before next check
     await new Promise(r => setTimeout(r, CHECK_INTERVAL_MS));
   }
 }
