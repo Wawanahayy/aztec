@@ -1,0 +1,18 @@
+{
+  "name": "aztec",
+  "version": "1.0.0",
+  "description": "",
+  "main": "java.mjs",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.16.0"
+  }
+}
