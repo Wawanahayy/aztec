@@ -130,7 +130,7 @@ async function tryFlush(currentEpoch) {
     }
 
     const tx = await flushRewarder.flushEntryQueue({
-      gasLimit: 300000,
+      gasLimit: 300000n,
       ...gasConfig
     });
 
