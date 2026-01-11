@@ -6,7 +6,7 @@ import 'dotenv/config';
 const GENESIS_TIMESTAMP = 1733356800; // Dec 5, 2024 @ 00:00 UTC
 const EPOCH_DURATION_SEC = 2304;       // 32 slots × 72 seconds
 const EPOCH_WINDOW_SEC = 15;           // Flush only in first 15 seconds of epoch
-const CHECK_INTERVAL_MS = 30_000;
+const CHECK_INTERVAL_MS = 10_000;
 const MAX_REWARD_TO_CLAIM = ethers.parseEther("1000");
 
 if (!process.env.RPC_URL) throw new Error("❌ Missing RPC_URL in .env");
