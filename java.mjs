@@ -1,146 +1,148 @@
-// run.mjs - Aztec Flush Bot (Simple & Accurate)
+// aztec-flush.mjs - Multi-Mode Flush Bot (slot-based, ETH Mainnet compatible)
 import { ethers } from 'ethers';
 import 'dotenv/config';
 
-const GENESIS_TIMESTAMP = 1733356800; // Dec 5, 2024 @ 00:00 UTC
-const EPOCH_DURATION_SEC = 2304;       // ~38.4 minutes
-const EPOCH_WINDOW_SEC = 15;           // Only first 15 seconds are valid
-const CHECK_INTERVAL_MS = 10_000;      // Normal check every 10s
-const MAX_REWARD_TO_CLAIM = ethers.parseEther("1000");
+const CHECK_INTERVAL_MS = 1000;
+const MAX_REWARD_TO_CLAIM = 1000n * 10n ** 18n; // 1000 AZTEC
 
-if (!process.env.RPC_URL) throw new Error("❌ Missing RPC_URL in .env");
-if (!process.env.PRIVATE_KEY) throw new Error("❌ Missing PRIVATE_KEY in .env");
+const FLUSH_MODE = (process.env.FLUSH_MODE || 'pre').toLowerCase();
+const PRE_SEND_SECONDS = parseInt(process.env.PRE_SEND_SECONDS || '3');
+const EPOCH_WINDOW_SEC = parseInt(process.env.FLUSH_VALID || '15'); // valid flush window in seconds
 
-const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+if (!['local', 'pre', 'block'].includes(FLUSH_MODE)) {
+  throw new Error('❌ Invalid FLUSH_MODE. Use: local, pre, or block');
+}
 
-const FLUSH_REWARDER_ABI = [
+
+const FLUSH_ADDR = '0x7C9a7130379F1B5dd6e7A53AF84fC0fE32267B65';
+const ROLLUP_ADDR = '0x603bb2c05D474794ea97805e8De69bCcFb3bCA12';
+
+
+const READ_RPC_URL = process.env.READ_RPC_URL || process.env.RPC_URL;
+const WRITE_RPC_URL = process.env.WRITE_RPC_URL || process.env.RPC_URL;
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+
+if (!READ_RPC_URL) throw new Error("❌ Missing READ_RPC_URL");
+if (!WRITE_RPC_URL) throw new Error("❌ Missing WRITE_RPC_URL");
+if (!PRIVATE_KEY) throw new Error("❌ Missing PRIVATE_KEY");
+
+// ── Provider & Wallet ──────────────────────────────────────
+const readProvider = new ethers.JsonRpcProvider(READ_RPC_URL);
+const writeProvider = new ethers.JsonRpcProvider(WRITE_RPC_URL);
+const wallet = new ethers.Wallet(PRIVATE_KEY, writeProvider);
+
+const FLUSH_ABI = [
   "function flushEntryQueue()",
   "function rewardsOf(address) view returns (uint256)",
   "function claimRewards()",
   "function rewardsAvailable() view returns (uint256)"
 ];
 
-const flushRewarder = new ethers.Contract(
-  '0x7C9a7130379F1B5dd6e7A53AF84fC0fE32267B65',
-  FLUSH_REWARDER_ABI,
-  wallet
-);
+const ROLLUP_ABI = [
+  "function getCurrentSlot() view returns (uint256)",
+  "function getSlotDuration() view returns (uint256)",
+  "function getEpochDuration() view returns (uint256)", // ⚠️ JUMLAH SLOT per epoch!
+  "function getActiveAttesterCount() view returns (uint256)",
+  "function isRewardsClaimable() view returns (bool)"
+];
 
-// --- Gas Configuration ---
-async function getGasConfig(provider, strategy, addGwei = 2, percent = 20) {
-  const feeData = await provider.getFeeData();
+// ── Kontrak ────────────────────────────────────────────────
+const flushRead = new ethers.Contract(FLUSH_ADDR, FLUSH_ABI, readProvider);
+const flushWrite = new ethers.Contract(FLUSH_ADDR, FLUSH_ABI, wallet);
+const rollupRead = new ethers.Contract(ROLLUP_ADDR, ROLLUP_ABI, readProvider);
 
-  const toBigInt = (value) => {
-    if (value == null) return null;
-    if (typeof value === 'bigint') return value;
-    if (typeof value === 'string') return BigInt(value);
-    if (typeof value === 'number') return BigInt(Math.floor(value));
-    return null;
-  };
+// ── Helper ─────────────────────────────────────────────────
+const toBigInt = (val) => {
+  if (typeof val === 'bigint') return val;
+  if (typeof val === 'string') return BigInt(val);
+  if (typeof val === 'number') return BigInt(Math.floor(val));
+  if (val && val._hex) return BigInt(val._hex);
+  return 0n;
+};
 
-  let baseMaxPriority = 1_000_000_000n;
-  let baseMaxFee = 2_000_000_000n;
+// ── Baca state on-chain lengkap ────────────────────────────
+async function getOnChainState() {
+  const [
+    currentSlot,
+    slotDurationSec,
+    slotsPerEpoch,
+    activeAttesters,
+    isClaimable,
+    userReward,
+    poolReward
+  ] = await Promise.all([
+    rollupRead.getCurrentSlot(),
+    rollupRead.getSlotDuration(),
+    rollupRead.getEpochDuration(),
+    rollupRead.getActiveAttesterCount(),
+    rollupRead.isRewardsClaimable(),
+    flushRead.rewardsOf(wallet.address),
+    flushRead.rewardsAvailable()
+  ]);
 
-  const maxPrio = toBigInt(feeData.maxPriorityFeePerGas);
-  const maxFee = toBigInt(feeData.maxFeePerGas);
-
-  if (maxPrio !== null) baseMaxPriority = maxPrio;
-  if (maxFee !== null) baseMaxFee = maxFee;
-
-  if ((maxFee === null || baseMaxFee === 0n) && feeData.gasPrice != null) {
-    const gasPrice = toBigInt(feeData.gasPrice);
-    if (gasPrice !== null) {
-      baseMaxFee = gasPrice;
-      baseMaxPriority = gasPrice / 2n;
-    }
-  }
-
-  if (strategy === 'aggressive') {
-    const addWei = BigInt(addGwei) * 1_000_000_000n;
-    return {
-      maxPriorityFeePerGas: baseMaxPriority + addWei,
-      maxFeePerGas: baseMaxFee + addWei
-    };
-  }
-
-  if (strategy === 'percent') {
-    const increaseFactor = 100n + BigInt(percent);
-    return {
-      maxPriorityFeePerGas: (baseMaxPriority * increaseFactor) / 100n,
-      maxFeePerGas: (baseMaxFee * increaseFactor) / 100n
-    };
-  }
+  const slotDur = toBigInt(slotDurationSec);
+  const slotsPerEp = toBigInt(slotsPerEpoch);
+  const epochNum = slotsPerEp > 0n ? currentSlot / slotsPerEp : 0n;
+  const slotsIntoEpoch = currentSlot % slotsPerEp;
+  const secondsIntoEpoch = slotsIntoEpoch * slotDur;
 
   return {
-    maxPriorityFeePerGas: baseMaxPriority,
-    maxFeePerGas: baseMaxFee
+    blockNumber: null, // akan diisi nanti
+    currentSlot: toBigInt(currentSlot),
+    slotDurationSec: slotDur,
+    slotsPerEpoch: slotsPerEp,
+    epochNum,
+    slotsIntoEpoch,
+    secondsIntoEpoch,
+    activeAttesters: toBigInt(activeAttesters),
+    isClaimable,
+    userReward: toBigInt(userReward),
+    poolReward: toBigInt(poolReward)
   };
 }
 
-// --- Epoch Info (Uses BLOCK TIMESTAMP) ---
-async function getEpochInfo() {
-  const block = await provider.getBlock('latest');
-  const currentTimestamp = block.timestamp;
-
-  if (currentTimestamp < GENESIS_TIMESTAMP) {
-    throw new Error("Aztec epoch has not started yet (before genesis).");
-  }
-
-  const elapsedTime = currentTimestamp - GENESIS_TIMESTAMP;
-  const currentEpoch = Math.floor(elapsedTime / EPOCH_DURATION_SEC);
-  const secondsIntoEpoch = elapsedTime % EPOCH_DURATION_SEC;
-  const epochStartSec = GENESIS_TIMESTAMP + currentEpoch * EPOCH_DURATION_SEC;
-  const epochEndSec = epochStartSec + EPOCH_DURATION_SEC;
-
-  return {
-    currentEpoch: BigInt(currentEpoch),
-    epochStart: new Date(epochStartSec * 1000),
-    epochEnd: new Date(epochEndSec * 1000),
-    nextEpochStart: new Date(epochEndSec * 1000),
-    isEarly: secondsIntoEpoch < EPOCH_WINDOW_SEC,
-    secondsIntoEpoch
-  };
-}
-
-// --- Flush Function ---
-async function tryFlush(currentEpoch) {
-  console.log(`🔍 Trying flush in epoch ${currentEpoch}...`);
+// ── Flush Function ─────────────────────────────────────────
+async function tryFlush(epochNum) {
   try {
-    const beforeReward = await flushRewarder.rewardsOf(wallet.address);
+    const startBlock = await writeProvider.getBlockNumber();
+    const timeString = new Date().toLocaleTimeString('en-GB', { hour12: false });
+    console.log(`🔍 Flushing epoch ${epochNum} at ${timeString} | Start block: ${startBlock}`);
 
-    const strategy = (process.env.GAS_STRATEGY || 'auto').toLowerCase();
-    const addGwei = parseInt(process.env.GAS_AGGRESSIVE_ADD_GWEI) || 2;
-    const percent = parseInt(process.env.GAS_PERCENT_INCREASE) || 20;
+    const before = await flushRead.rewardsOf(wallet.address);
+    const beforeBigInt = toBigInt(before);
 
-    const gasConfig = await getGasConfig(provider, strategy, addGwei, percent);
+    const feeData = await writeProvider.getFeeData();
+    let maxFee = feeData.maxFeePerGas ? toBigInt(feeData.maxFeePerGas) : 2_000_000_000n;
+    let maxPrio = feeData.maxPriorityFeePerGas ? toBigInt(feeData.maxPriorityFeePerGas) : 1_000_000_000n;
+    maxFee = (maxFee * 130n) / 100n;
+    maxPrio = (maxPrio * 130n) / 100n;
 
-    if (strategy !== 'auto') {
-      const maxFeeGwei = ethers.formatUnits(gasConfig.maxFeePerGas || 0n, 'gwei');
-      console.log(`⛽ Gas mode: ${strategy} | MaxFee: ${parseFloat(maxFeeGwei).toFixed(2)} Gwei`);
-    }
-
-    const tx = await flushRewarder.flushEntryQueue({
+    const tx = await flushWrite.flushEntryQueue({
       gasLimit: 300000n,
-      ...gasConfig
+      maxFeePerGas: maxFee,
+      maxPriorityFeePerGas: maxPrio
     });
 
+    console.log(`📤 Tx sent: ${tx.hash}`);
     const receipt = await tx.wait();
-    const gasCost = ethers.formatEther(receipt.gasUsed * receipt.effectiveGasPrice);
-    const afterReward = await flushRewarder.rewardsOf(wallet.address);
-    const earned = afterReward - beforeReward;
+
+    const gasUsed = BigInt(receipt.gasUsed);
+    const gasPrice = BigInt(receipt.effectiveGasPrice || receipt.gasPrice || 0n);
+    const gasCost = ethers.formatEther(gasUsed * gasPrice);
+
+    const after = await flushRead.rewardsOf(wallet.address);
+    const earned = toBigInt(after) - beforeBigInt;
 
     if (earned > 0n) {
-      const earnedAZTEC = ethers.formatUnits(earned, 18);
-      console.log(`🎉 Success! +${earnedAZTEC} $AZTEC | Gas: ${gasCost} ETH | Tx: ${tx.hash}`);
+      const aztec = ethers.formatUnits(earned, 18);
+      console.log(`🎉 SUCCESS! +${aztec} $AZTEC | Confirmed in block: ${receipt.blockNumber} | Gas: ${gasCost} ETH`);
     } else {
-      console.log(`ℹ️ Flush succeeded, but no reward earned.`);
+      console.log(`ℹ️ Flush succeeded in block ${receipt.blockNumber}, but no reward. Gas: ${gasCost} ETH`);
     }
-
     return earned > 0n;
   } catch (e) {
     if (e.message.includes('no validators') || e.message.includes('already flushed')) {
-      console.log('ℹ️ No validators in queue or already flushed.');
+      console.log('ℹ️ No validators in queue.');
     } else {
       console.error('💥 Flush failed:', e.message);
     }
@@ -148,91 +150,125 @@ async function tryFlush(currentEpoch) {
   }
 }
 
-// --- Auto Claim ---
+
 async function autoClaim() {
   try {
-    const rewards = await flushRewarder.rewardsOf(wallet.address);
-    if (rewards > 0n && rewards <= MAX_REWARD_TO_CLAIM) {
-      const formatted = ethers.formatUnits(rewards, 18);
-      console.log(`🪙 Claiming reward: ${formatted} $AZTEC`);
-      const tx = await flushRewarder.claimRewards();
+    const claimable = await rollupRead.isRewardsClaimable().catch(() => true);
+    if (!claimable) return;
+
+    const r = toBigInt(await flushRead.rewardsOf(wallet.address));
+    if (r > 0n && r <= MAX_REWARD_TO_CLAIM) {
+      console.log(`🪙 Claiming: ${ethers.formatUnits(r, 18)} $AZTEC`);
+      const tx = await flushWrite.claimRewards();
       await tx.wait();
       console.log('✅ Claim success!');
-    } else if (rewards > MAX_REWARD_TO_CLAIM) {
-      console.warn(`⚠️ Reward too large (${ethers.formatUnits(rewards, 18)} $AZTEC). Exceeds claim limit.`);
     }
   } catch (e) {
-    console.error('⚠️ Failed to claim:', e.message);
+    console.error('⚠️ Claim failed:', e.message);
   }
 }
 
-// --- Main Loop ---
-async function runForever() {
-  const GAS_STRATEGY = (process.env.GAS_STRATEGY || 'auto').toLowerCase();
-  if (!['auto', 'aggressive', 'percent'].includes(GAS_STRATEGY)) {
-    console.warn(`⚠️ Invalid GAS_STRATEGY: "${GAS_STRATEGY}". Use: auto, aggressive, or percent.`);
-  }
+// ── Format waktu ───────────────────────────────────────────
+function formatTimeRemaining(seconds) {
+  if (seconds <= 0) return "Now!";
+  if (seconds < 60) return `${seconds}s`;
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins}m ${secs}s`;
+}
 
-  const ethBalance = await provider.getBalance(wallet.address);
+// ── Main Loop ──────────────────────────────────────────────
+async function run() {
+  const balance = await readProvider.getBalance(wallet.address);
   console.log(`🚀 Bot active | Wallet: ${wallet.address}`);
-  console.log(`💰 ETH Balance: ${ethers.formatEther(ethBalance)} ETH`);
-  console.log(`⚙️  Gas Strategy: ${GAS_STRATEGY}`);
-  console.log(`🛡️  Max Claim: ${ethers.formatEther(MAX_REWARD_TO_CLAIM)} $AZTEC`);
-  console.log(`⏱️  Flush window: first ${EPOCH_WINDOW_SEC} seconds of each epoch\n`);
+  console.log(`💰 ETH Balance: ${ethers.formatEther(balance)} ETH`);
+  console.log(`📡 Read RPC: ${READ_RPC_URL.replace(/(.*)(.{4})$/, '***$2')}`);
+  console.log(`📤 Write RPC: ${WRITE_RPC_URL.replace(/(.*)(.{4})$/, '***$2')}`);
+  console.log(`⏱️  Flush mode: ${FLUSH_MODE}${FLUSH_MODE === 'pre' ? ` (send ${PRE_SEND_SECONDS}s early)` : ''}`);
+  console.log(`⏱️  Flush window: first ${EPOCH_WINDOW_SEC} seconds of epoch (on-chain)\n`);
 
   let lastFlushedEpoch = -1n;
 
   while (true) {
     try {
-      const nowLocal = new Date();
-      const info = await getEpochInfo();
+      const block = await readProvider.getBlock('latest');
+      const state = await getOnChainState();
+      state.blockNumber = block.number;
 
-      // Read rewards & pool
-      let rewardsAZTEC = "0.0";
-      let poolAZTEC = "0.0";
-      try {
-        const r = await flushRewarder.rewardsOf(wallet.address);
-        rewardsAZTEC = ethers.formatUnits(r, 18);
-        const pool = await flushRewarder.rewardsAvailable();
-        poolAZTEC = ethers.formatUnits(pool, 18);
-      } catch (e) {
-        console.error('Failed to read reward/pool status:', e.message);
-      }
+      const {
+        epochNum,
+        secondsIntoEpoch,
+        slotsIntoEpoch,
+        slotDurationSec,
+        slotsPerEpoch,
+        activeAttesters,
+        isClaimable,
+        userReward,
+        poolReward
+      } = state;
 
-      // Simple countdown for display only
-      const diffMs = info.nextEpochStart.getTime() - Date.now();
-      const countdown = diffMs <= 0 ? "Now!" : `${Math.ceil(diffMs / 1000)}s`;
+      const rewardsAZTEC = ethers.formatUnits(userReward, 18);
+      const poolAZTEC = ethers.formatUnits(poolReward, 18);
+
+      // Prediksi waktu ke epoch berikutnya (untuk mode 'pre')
+      const slotsUntilNextEpoch = slotsPerEpoch - slotsIntoEpoch;
+      const secondsUntilNextEpoch = Number(slotsUntilNextEpoch * slotDurationSec);
+      const realtimeCountdown = formatTimeRemaining(secondsUntilNextEpoch);
 
       console.log(
-        `[${nowLocal.toLocaleTimeString()}] 📊 Epoch ${info.currentEpoch}\n` +
+        `[${new Date().toLocaleTimeString()}] 📊 Epoch ${epochNum.toString()}\n` +
         `   💰 Your rewards : ${rewardsAZTEC} $AZTEC\n` +
         `   🏦 Reward Pool  : ${poolAZTEC} $AZTEC\n` +
-        `   🕒 START        : ${info.epochStart.toLocaleTimeString()}\n` +
-        `   🕔 END          : ${info.epochEnd.toLocaleTimeString()}\n` +
-        `   ⏳ Next flush in: ${countdown}\n`
+        `   👥 Attesters    : ${activeAttesters.toString()}\n` +
+        `   🧮 Slot         : ${state.currentSlot.toString()} (${slotsIntoEpoch.toString()} into epoch)\n` +
+        `   ⏱️ On-chain     : ${secondsIntoEpoch.toString()}s into epoch\n` +
+        `   ⏳ Next epoch in: ${realtimeCountdown} (${secondsUntilNextEpoch}s)\n`
       );
 
-      // Always claim if there's unclaimed reward
-      if (rewardsAZTEC !== "0.0") {
-        await autoClaim();
+      if (userReward > 0n) await autoClaim();
+
+      // ── LOGIKA FLUSH BERDASARKAN MODE ───────────────────────
+      let shouldFlush = false;
+      let flushReason = "";
+
+      if (FLUSH_MODE === 'block') {
+        // Reaktif: flush jika on-chain secondsIntoEpoch dalam window
+        if (secondsIntoEpoch <= BigInt(EPOCH_WINDOW_SEC) && epochNum !== lastFlushedEpoch) {
+          shouldFlush = true;
+          flushReason = "on-chain time in flush window";
+        }
+      } else if (FLUSH_MODE === 'local') {
+        // Gunakan estimasi lokal (tidak disarankan, tapi tetap didukung)
+        const localSecondsInto = secondsIntoEpoch; // fallback ke on-chain karena tidak ada genesis
+        if (localSecondsInto <= BigInt(EPOCH_WINDOW_SEC) && epochNum !== lastFlushedEpoch) {
+          shouldFlush = true;
+          flushReason = "local estimate in window";
+        }
+      } else if (FLUSH_MODE === 'pre') {
+        // Kirim X detik sebelum epoch baru dimulai
+        if (secondsUntilNextEpoch <= PRE_SEND_SECONDS && epochNum !== lastFlushedEpoch) {
+          shouldFlush = true;
+          flushReason = `pre-send (${secondsUntilNextEpoch}s before next epoch)`;
+        }
       }
 
-      // Flush ONLY if:
-      // 1. We're in the first 15s of the epoch (on-chain time)
-      // 2. We haven't flushed this epoch yet
-      if (info.isEarly && info.currentEpoch !== lastFlushedEpoch) {
-        await tryFlush(info.currentEpoch);
-        await autoClaim(); // claim immediately after flush if any
-        lastFlushedEpoch = info.currentEpoch;
+      if (shouldFlush) {
+        console.log(`🎯 Flush triggered: ${flushReason}`);
+        await tryFlush(epochNum);
+        await autoClaim();
+        lastFlushedEpoch = epochNum;
       }
 
     } catch (e) {
-      console.error('❌ Main loop error:', e.message);
+      console.error('❌ Loop error:', e.message);
     }
-
-    // Wait before next check
     await new Promise(r => setTimeout(r, CHECK_INTERVAL_MS));
   }
 }
 
-runForever().catch(console.error);
+run().catch(console.error);
+
+process.on('SIGINT', () => {
+  console.log('\n🛑 Shutting down...');
+  process.exit(0);
+});
